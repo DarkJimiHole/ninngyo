@@ -27,6 +27,7 @@ HELP_TEXT = """监听某群里某人的发言并自动转发。以下命令都�
 <b>查 id</b>
 <code>,wf chats [关键词]</code> 列出已加入的群/频道及 id
 <code>,wf who 群 关键词</code> 按名字/用户名在群里查找用户 id
+回复转发来的消息：<code>,wf who 来源群</code> 查原发送者 id（对方隐藏转发来源时也能查）
 
 <b>添加规则</b>
 <code>,wf add 来源 用户 目标 [copy]</code>
@@ -116,6 +117,31 @@ def origin_id(message: Message) -> Optional[int]:
     return None
 
 
+async def find_original_sender(client: Client, chat_id: int, fwd: Message) -> Optional[int]:
+    """对方隐藏了转发来源时，按原消息的发送时间和内容去来源群的记录里找到原消息，取发送者 id。"""
+    date = getattr(fwd.forward_origin, "date", None)
+    if not date:
+        return None
+    content = fwd.text or fwd.caption
+    candidates = []
+    # offset_date 返回早于该时间的消息，所以往后放 2 秒
+    async for msg in client.get_chat_history(
+        chat_id, offset_date=date + datetime.timedelta(seconds=2), limit=100
+    ):
+        if not msg.date or msg.date < date - datetime.timedelta(seconds=1):
+            break
+        if abs((msg.date - date).total_seconds()) > 1:
+            continue
+        peer = msg.from_user or msg.sender_chat
+        if not peer:
+            continue
+        if content and (msg.text or msg.caption) == content:
+            return peer.id
+        candidates.append(peer.id)
+    # 内容对不上（比如原消息被编辑过）时，只有同一时刻仅一个人发言才采用
+    return candidates[0] if len(set(candidates)) == 1 else None
+
+
 def display_name(peer) -> str:
     name = getattr(peer, "title", None) or " ".join(
         filter(None, [getattr(peer, "first_name", None), getattr(peer, "last_name", None)])
@@ -175,12 +201,21 @@ async def wf_chats(client: Client, message: Message):
 
 @wf.sub_command(command="who")
 async def wf_who(client: Client, message: Message):
-    if len(message.parameter) < 3:
-        return await respond(message, "用法：<code>,wf who 群 关键词</code>")
+    reply = message.reply_to_message
+    if len(message.parameter) < 2 or (len(message.parameter) < 3 and not reply):
+        return await respond(
+            message,
+            "用法：<code>,wf who 群 关键词</code>，或回复一条转发来的消息：<code>,wf who 来源群</code>",
+        )
     try:
         chat_id = await resolve_chat(client, message, message.parameter[1])
     except Exception as e:
         return await respond(message, f"无法识别群：{e}")
+    if reply and len(message.parameter) == 2:
+        uid = origin_id(reply) or await find_original_sender(client, chat_id, reply)
+        if uid is None:
+            return await respond(message, "没能在这个群的记录里找到这条消息的原消息。")
+        return await respond(message, f"原发送者 id：<code>{uid}</code>")
     keyword = " ".join(message.parameter[2:])
     lowered = keyword.lower()
     found = {}
@@ -224,12 +259,14 @@ async def wf_add(client: Client, message: Message):
             target = await resolve_chat(client, message, params[2])
         elif reply and len(params) == 2:
             # 收藏夹里回复一条转发来的消息：用户取原发送者
-            uid = origin_id(reply)
+            src = await resolve_chat(client, message, params[0])
+            uid = origin_id(reply) or await find_original_sender(client, src, reply)
             if uid is None:
                 return await respond(
-                    message, "对方隐藏了转发来源，拿不到 id，请用 <code>,wf who</code> 查找。"
+                    message,
+                    "对方隐藏了转发来源，且没能在来源群的记录里找到原消息，"
+                    "请用 <code>,wf who 群 名字</code> 查找。",
                 )
-            src = await resolve_chat(client, message, params[0])
             users = [uid]
             target = await resolve_chat(client, message, params[1])
         elif reply and len(params) == 1:

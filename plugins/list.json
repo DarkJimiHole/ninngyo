@@ -2,10 +2,10 @@
     "list": [
         {
             "name": "watch_forward",
-            "version": "1.1",
+            "version": "1.2",
             "section": "chat",
             "maintainer": "DarkJimiHole",
-            "size": "13.428 kb",
+            "size": "15.312 kb",
             "supported": true,
             "des_short": "监听指定用户发言并自动转发",
             "des": "监听某个群组/频道里指定用户的发言，自动转发到另一个对话。用法见 ,wf"
