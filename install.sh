@@ -7,8 +7,11 @@
 # 用法：bash install.sh [命令]，不带命令时等同 install。详见 bash install.sh help
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_URL="https://github.com/DarkJimiHole/ninngyo.git"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 INSTALL_DIR="${NINNGYO_DIR:-/opt/ninngyo}"
+SRC_DIR="${INSTALL_DIR}/src"
+SELF="$SCRIPT_DIR/install.sh"
 PROJECT="${NINNGYO_PROJECT:-ninngyo}"
 PGM_IMAGE="${PGM_IMAGE:-teampgm/pagermaid_pyro:latest}"
 SS_IMAGE="${SS_IMAGE:-ghcr.io/shadowsocks/sslocal-rust:v1.25.0}"
@@ -51,11 +54,11 @@ compose() {
 }
 
 require_root() {
-    [[ $EUID -eq 0 ]] || die "请使用 root 运行（sudo bash $0 ${CMD:-}）"
+    [[ $EUID -eq 0 ]] || die "请使用 root 运行（sudo bash $SELF ${CMD:-}）"
 }
 
 require_installed() {
-    [[ -f "$INSTALL_DIR/docker-compose.yml" ]] || die "尚未安装，请先执行：bash $0 install"
+    [[ -f "$INSTALL_DIR/docker-compose.yml" ]] || die "尚未安装，请先执行：bash $SELF install"
 }
 
 ensure_docker() {
@@ -342,7 +345,7 @@ cmd_login() {
     echo
     read -r -p "按回车继续..." </dev/tty
     compose run --rm --name "${PROJECT}-pagermaid-login" pagermaid || true
-    is_logged_in || die "未检测到有效登录，可重新执行：bash $0 login"
+    is_logged_in || die "未检测到有效登录，可重新执行：bash $SELF login"
     info "登录成功"
     compose up -d
 }
@@ -354,7 +357,7 @@ cmd_install() {
     chmod 700 "$INSTALL_DIR"
 
     if [[ -f "$INSTALL_DIR/ss-local.json" ]] && [[ -z "${SS_URI:-}${SS_SERVER:-}" ]]; then
-        info "已存在代理配置，保留（如需修改：bash $0 proxy）"
+        info "已存在代理配置，保留（如需修改：bash $SELF proxy）"
     else
         collect_ss
         write_ss_config
@@ -367,7 +370,7 @@ cmd_install() {
     check_proxy || die "代理检查未通过，请确认服务器 B 的 ssserver 配置、端口和防火墙（需放行 A 的 IP）"
 
     if [[ -n "${NINNGYO_SKIP_LOGIN:-}" ]]; then
-        info "已跳过登录，之后执行：bash $0 login"
+        info "已跳过登录，之后执行：bash $SELF login"
         return
     fi
     cmd_login
@@ -418,7 +421,7 @@ cmd_uninstall() {
 
 usage() {
     cat <<EOF
-用法：bash $0 [命令]
+用法：bash $SELF [命令]
 
   install     安装/修复（默认）：配置代理、生成配置、拉镜像、检查链路、登录
   login       登录 Telegram 账号（会话失效时也用它）
@@ -438,7 +441,40 @@ usage() {
 EOF
 }
 
+ensure_git() {
+    command -v git >/dev/null 2>&1 && return
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y -qq git
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q git
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q git
+    else
+        die "请先安装 git"
+    fi
+}
+
+# 通过 curl 直接运行时脚本旁边没有仓库文件：先 clone 到 SRC_DIR，再从那里重新执行
+bootstrap() {
+    [[ -f "$SCRIPT_DIR/install.sh" && -f "$SCRIPT_DIR/plugins/list.json" ]] && return
+    [[ $EUID -eq 0 ]] || die "请使用 root 运行"
+    ensure_git
+    if [[ -d "$SRC_DIR/.git" ]]; then
+        git -C "$SRC_DIR" pull -q --ff-only || warn "git pull 失败，使用本地已有版本"
+    else
+        mkdir -p "$INSTALL_DIR"
+        chmod 700 "$INSTALL_DIR"
+        git clone -q --depth 1 "$REPO_URL" "$SRC_DIR"
+    fi
+    # curl | bash 时标准输入是脚本本身，交给重新执行的脚本前换回终端
+    if [[ ! -t 0 ]] && (exec </dev/tty) 2>/dev/null; then
+        exec bash "$SRC_DIR/install.sh" "$@" </dev/tty
+    fi
+    exec bash "$SRC_DIR/install.sh" "$@"
+}
+
 CMD="${1:-install}"
+bootstrap "$@"
 case "$CMD" in
     install) cmd_install ;;
     login) require_root && cmd_login ;;
