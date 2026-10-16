@@ -2,11 +2,13 @@
 
 import contextlib
 import datetime
+import html
 from asyncio import sleep
 from random import uniform
 from typing import Dict, List, Optional, Union
 
 import pytz
+from pyrogram.enums import ChatType
 from pyrogram.errors import FloodWait, RPCError
 
 from pagermaid.config import Config
@@ -20,20 +22,27 @@ from pagermaid.utils.bot_utils import log
 
 DB_KEY = "watch_forward.rules"
 MODES = ("forward", "copy")
-HELP_TEXT = """监听某群里某人的发言并自动转发。
+HELP_TEXT = """监听某群里某人的发言并自动转发。以下命令都可以在收藏夹里执行，群里不会留下痕迹。
 
-<b>在来源群里回复那个人的任意一条消息</b>，发送：
-<code>,wf add 目标 [copy]</code>
+<b>查 id</b>
+<code>,wf chats [关键词]</code> 列出已加入的群/频道及 id
+<code>,wf who 群 关键词</code> 按名字/用户名在群里查找用户 id
 
-或者完整写法：
+<b>添加规则</b>
 <code>,wf add 来源 用户 目标 [copy]</code>
   来源/目标：对话 id、@用户名，或 here（当前对话）
   用户：用户 id 或 @用户名，多个用英文逗号分隔
   copy：不显示"转发自"（默认 forward 显示原发送者）
+把那个人的消息转发到收藏夹，回复它：<code>,wf add 来源 目标 [copy]</code>
+在来源群里回复那个人的消息：<code>,wf add 目标 [copy]</code>（命令会立即删除，结果发到收藏夹）
 
+<b>管理</b>
 <code>,wf list</code> 列出规则
 <code>,wf del 编号</code> 删除规则
 <code>,wf on/off 编号</code> 启用/暂停规则"""
+
+LIST_LIMIT = 50
+GROUP_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.FORUM, ChatType.CHANNEL)
 
 # 缓存，避免每条消息都读一次数据库
 _rules: Optional[List[Dict]] = None
@@ -95,6 +104,36 @@ def sender_id(message: Message) -> Optional[int]:
     return None
 
 
+def origin_id(message: Message) -> Optional[int]:
+    """转发消息的原发送者 id；对方隐藏了转发来源时返回 None。"""
+    origin = message.forward_origin
+    if origin is None:
+        return sender_id(message)
+    for attr in ("sender_user", "sender_chat", "chat"):
+        peer = getattr(origin, attr, None)
+        if peer:
+            return peer.id
+    return None
+
+
+def display_name(peer) -> str:
+    name = getattr(peer, "title", None) or " ".join(
+        filter(None, [getattr(peer, "first_name", None), getattr(peer, "last_name", None)])
+    )
+    username = f" @{peer.username}" if getattr(peer, "username", None) else ""
+    return f"{html.escape(name or '')}{username}"
+
+
+async def respond(message: Message, text: str):
+    """在群/频道里执行时立即删除命令消息，结果发到收藏夹，避免被群友看到。"""
+    if message.chat.type in GROUP_TYPES:
+        with contextlib.suppress(Exception):
+            await message.delete()
+        await bot.send_message("me", text)
+    else:
+        await message.edit(text)
+
+
 def format_rule(index: int, rule: Dict) -> str:
     users = ", ".join(f"<code>{i}</code>" for i in rule["users"])
     status = "" if rule.get("enabled", True) else " ⏸已暂停"
@@ -110,10 +149,65 @@ def format_rule(index: int, rule: Dict) -> str:
     parameters=HELP_TEXT,
 )
 async def wf(message: Message):
-    await message.edit(HELP_TEXT)
+    await respond(message, HELP_TEXT)
 
 
 wf: "CommandHandler"
+
+
+@wf.sub_command(command="chats")
+async def wf_chats(client: Client, message: Message):
+    keyword = " ".join(message.parameter[1:]).lower()
+    lines = []
+    async for dialog in client.get_dialogs():
+        chat = dialog.chat
+        if not chat or chat.type not in GROUP_TYPES:
+            continue
+        if keyword and keyword not in f"{chat.title or ''} {chat.username or ''}".lower():
+            continue
+        kind = "频道" if chat.type == ChatType.CHANNEL else "群"
+        lines.append(f"<code>{chat.id}</code> {kind} {display_name(chat)}")
+        if len(lines) >= LIST_LIMIT:
+            lines.append(f"……只显示前 {LIST_LIMIT} 个，请加关键词缩小范围")
+            break
+    await respond(message, "\n".join(lines) or "没有找到匹配的群或频道。")
+
+
+@wf.sub_command(command="who")
+async def wf_who(client: Client, message: Message):
+    if len(message.parameter) < 3:
+        return await respond(message, "用法：<code>,wf who 群 关键词</code>")
+    try:
+        chat_id = await resolve_chat(client, message, message.parameter[1])
+    except Exception as e:
+        return await respond(message, f"无法识别群：{e}")
+    keyword = " ".join(message.parameter[2:])
+    lowered = keyword.lower()
+    found = {}
+    # 先搜成员列表（普通群会忽略 query 返回全部成员，所以本地再筛一遍）；
+    # 成员列表被隐藏或是频道时，退回到扫描最近的聊天记录
+    with contextlib.suppress(Exception):
+        async for member in client.get_chat_members(chat_id, query=keyword, limit=200):
+            if member.user and lowered in display_name(member.user).lower():
+                found[member.user.id] = member.user
+                if len(found) >= 20:
+                    break
+    if not found:
+        with contextlib.suppress(Exception):
+            async for msg in client.get_chat_history(chat_id, limit=1000):
+                peer = msg.from_user or msg.sender_chat
+                if not peer or peer.id in found:
+                    continue
+                if lowered in display_name(peer).lower():
+                    found[peer.id] = peer
+                    if len(found) >= 20:
+                        break
+    if not found:
+        return await respond(message, "没有找到匹配的用户。")
+    await respond(
+        message,
+        "\n".join(f"<code>{pid}</code> {display_name(peer)}" for pid, peer in found.items()),
+    )
 
 
 @wf.sub_command(command="add")
@@ -124,25 +218,39 @@ async def wf_add(client: Client, message: Message):
         mode = params.pop().lower()
     reply = message.reply_to_message
     try:
-        if reply and len(params) == 1:
-            src = message.chat.id
-            uid = sender_id(reply)
-            if uid is None:
-                return await message.edit("无法识别被回复消息的发送者。")
-            users = [uid]
-            target = await resolve_chat(client, message, params[0])
-        elif len(params) == 3:
+        if len(params) == 3:
             src = await resolve_chat(client, message, params[0])
             users = await resolve_users(client, params[1])
             target = await resolve_chat(client, message, params[2])
+        elif reply and len(params) == 2:
+            # 收藏夹里回复一条转发来的消息：用户取原发送者
+            uid = origin_id(reply)
+            if uid is None:
+                return await respond(
+                    message, "对方隐藏了转发来源，拿不到 id，请用 <code>,wf who</code> 查找。"
+                )
+            src = await resolve_chat(client, message, params[0])
+            users = [uid]
+            target = await resolve_chat(client, message, params[1])
+        elif reply and len(params) == 1:
+            if message.chat.type not in GROUP_TYPES:
+                return await respond(
+                    message, "不在群里时请用：回复转发的消息 <code>,wf add 来源 目标</code>"
+                )
+            uid = sender_id(reply)
+            if uid is None:
+                return await respond(message, "无法识别被回复消息的发送者。")
+            src = message.chat.id
+            users = [uid]
+            target = await resolve_chat(client, message, params[0])
         else:
-            return await message.edit(HELP_TEXT)
+            return await respond(message, HELP_TEXT)
     except Exception as e:
-        return await message.edit(f"参数解析失败：{e}")
+        return await respond(message, f"参数解析失败：{html.escape(str(e))}")
     if not users:
-        return await message.edit("没有识别到任何用户。")
+        return await respond(message, "没有识别到任何用户。")
     if src == target:
-        return await message.edit("来源和目标不能是同一个对话。")
+        return await respond(message, "来源和目标不能是同一个对话。")
 
     rules = list(load_rules())
     for rule in rules:
@@ -155,7 +263,7 @@ async def wf_add(client: Client, message: Message):
         )
     save_rules(rules)
     text = f"已添加：<code>{src}</code> 中 {users} 的发言 → <code>{target}</code> ({mode})"
-    await message.edit(text)
+    await respond(message, text)
     await log(f"watch_forward {text}")
 
 
@@ -163,9 +271,9 @@ async def wf_add(client: Client, message: Message):
 async def wf_list(message: Message):
     rules = load_rules()
     if not rules:
-        return await message.edit("当前没有转发规则。")
-    await message.edit(
-        "\n".join(format_rule(i, r) for i, r in enumerate(rules, start=1))
+        return await respond(message, "当前没有转发规则。")
+    await respond(
+        message, "\n".join(format_rule(i, r) for i, r in enumerate(rules, start=1))
     )
 
 
@@ -183,21 +291,21 @@ def get_index(message: Message) -> Optional[int]:
 async def wf_del(message: Message):
     index = get_index(message)
     if index is None:
-        return await message.edit("编号无效，用 <code>,wf list</code> 查看。")
+        return await respond(message, "编号无效，用 <code>,wf list</code> 查看。")
     rules = list(load_rules())
     rule = rules.pop(index)
     save_rules(rules)
-    await message.edit(f"已删除：\n{format_rule(index + 1, rule)}")
+    await respond(message, f"已删除：\n{format_rule(index + 1, rule)}")
 
 
 async def set_enabled(message: Message, enabled: bool):
     index = get_index(message)
     if index is None:
-        return await message.edit("编号无效，用 <code>,wf list</code> 查看。")
+        return await respond(message, "编号无效，用 <code>,wf list</code> 查看。")
     rules = list(load_rules())
     rules[index]["enabled"] = enabled
     save_rules(rules)
-    await message.edit(format_rule(index + 1, rules[index]))
+    await respond(message, format_rule(index + 1, rules[index]))
 
 
 @wf.sub_command(command="on")
