@@ -444,13 +444,17 @@ async def watch_forward_handler(message: Message):
     uid = sender_id(message)
     if uid is None:
         return
+    # 本账号和 sudo 用户可能各自加了相同的规则，同一目标只转发一次
+    done = set()
     for rule in rules:
         if (
             rule["src"] != message.chat.id
             or uid not in rule["users"]
             or not rule.get("enabled", True)
+            or rule["target"] in done
         ):
             continue
+        done.add(rule["target"])
         if message.media_group_id:
             # 相册会拆成多条消息到达，延迟几秒合并成一次转发
             key = f"watch_forward.{rule['target']}.{message.media_group_id}"
