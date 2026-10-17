@@ -14,7 +14,6 @@ from pyrogram.errors import FloodWait, RPCError
 from pagermaid.config import Config
 from pagermaid.dependence import sqlite
 from pagermaid.enums import Client, Message
-from pagermaid.enums.command import CommandHandler
 from pagermaid.listener import listener
 from pagermaid.services import bot, scheduler
 from pagermaid.utils import logs
@@ -40,7 +39,9 @@ HELP_TEXT = """监听某群里某人的发言并自动转发。以下命令都�
 <b>管理</b>
 <code>,wf list</code> 列出规则
 <code>,wf del 编号</code> 删除规则
-<code>,wf on/off 编号</code> 启用/暂停规则"""
+<code>,wf on/off 编号</code> 启用/暂停规则
+
+sudo 用户（需 <code>plugins.wf</code> 权限）用 <code>/wf</code>，在和本账号的私聊里操作，只能管理自己添加的规则。"""
 
 LIST_LIMIT = 50
 GROUP_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.FORUM, ChatType.CHANNEL)
@@ -150,38 +151,46 @@ def display_name(peer) -> str:
     return f"{html.escape(name or '')}{username}"
 
 
+def is_owner(message: Message) -> bool:
+    """是否为本账号自己发出的命令（否则是 sudo 用户）。"""
+    return bool(message.outgoing or (message.from_user and message.from_user.is_self))
+
+
 async def respond(message: Message, text: str):
-    """在群/频道里执行时立即删除命令消息，结果发到收藏夹，避免被群友看到。"""
+    """在群/频道里执行时立即删除命令消息，结果私下发送，避免被群友看到。
+
+    本账号的结果发到收藏夹；sudo 用户的结果发到他和本账号的私聊。
+    """
+    owner = is_owner(message)
+    if not owner:
+        text = text.replace(",wf", "/wf").replace("收藏夹", "和本账号的私聊")
     if message.chat.type in GROUP_TYPES:
         with contextlib.suppress(Exception):
             await message.delete()
-        await bot.send_message("me", text)
+        await bot.send_message("me" if owner else sender_id(message), text)
     else:
         await message.edit(text)
+
+
+def visible_rules(message: Message) -> List[tuple]:
+    """返回 (全局下标, 规则)：本账号看到全部规则，sudo 用户只看到自己添加的。"""
+    rules = load_rules()
+    if is_owner(message):
+        return list(enumerate(rules))
+    uid = sender_id(message)
+    return [(i, r) for i, r in enumerate(rules) if r.get("owner") == uid]
 
 
 def format_rule(index: int, rule: Dict) -> str:
     users = ", ".join(f"<code>{i}</code>" for i in rule["users"])
     status = "" if rule.get("enabled", True) else " ⏸已暂停"
+    added_by = f" 〔sudo <code>{rule['owner']}</code>〕" if rule.get("owner") else ""
     return (
         f"<b>{index}.</b> <code>{rule['src']}</code> 中 {users}\n"
-        f"    → <code>{rule['target']}</code> ({rule['mode']}){status}"
+        f"    → <code>{rule['target']}</code> ({rule['mode']}){status}{added_by}"
     )
 
 
-@listener(
-    command="wf",
-    description="监听指定用户发言并自动转发",
-    parameters=HELP_TEXT,
-)
-async def wf(message: Message):
-    await respond(message, HELP_TEXT)
-
-
-wf: "CommandHandler"
-
-
-@wf.sub_command(command="chats")
 async def wf_chats(client: Client, message: Message):
     keyword = " ".join(message.parameter[1:]).lower()
     lines = []
@@ -199,7 +208,6 @@ async def wf_chats(client: Client, message: Message):
     await respond(message, "\n".join(lines) or "没有找到匹配的群或频道。")
 
 
-@wf.sub_command(command="who")
 async def wf_who(client: Client, message: Message):
     reply = message.reply_to_message
     if len(message.parameter) < 2 or (len(message.parameter) < 3 and not reply):
@@ -245,7 +253,6 @@ async def wf_who(client: Client, message: Message):
     )
 
 
-@wf.sub_command(command="add")
 async def wf_add(client: Client, message: Message):
     params = message.parameter[1:]
     mode = "forward"
@@ -289,14 +296,27 @@ async def wf_add(client: Client, message: Message):
     if src == target:
         return await respond(message, "来源和目标不能是同一个对话。")
 
+    owner = None if is_owner(message) else sender_id(message)
     rules = list(load_rules())
     for rule in rules:
-        if rule["src"] == src and rule["target"] == target and rule["mode"] == mode:
+        if (
+            rule["src"] == src
+            and rule["target"] == target
+            and rule["mode"] == mode
+            and rule.get("owner") == owner
+        ):
             rule["users"] = sorted(set(rule["users"]) | set(users))
             break
     else:
         rules.append(
-            {"src": src, "users": users, "target": target, "mode": mode, "enabled": True}
+            {
+                "src": src,
+                "users": users,
+                "target": target,
+                "mode": mode,
+                "enabled": True,
+                "owner": owner,
+            }
         )
     save_rules(rules)
     text = f"已添加：<code>{src}</code> 中 {users} 的发言 → <code>{target}</code> ({mode})"
@@ -304,35 +324,36 @@ async def wf_add(client: Client, message: Message):
     await log(f"watch_forward {text}")
 
 
-@wf.sub_command(command="list")
-async def wf_list(message: Message):
-    rules = load_rules()
+async def wf_list(client: Client, message: Message):
+    rules = visible_rules(message)
     if not rules:
         return await respond(message, "当前没有转发规则。")
     await respond(
-        message, "\n".join(format_rule(i, r) for i, r in enumerate(rules, start=1))
+        message,
+        "\n".join(format_rule(n, r) for n, (_, r) in enumerate(rules, start=1)),
     )
 
 
 def get_index(message: Message) -> Optional[int]:
+    """把用户看到的编号换算成全局下标。"""
     if len(message.parameter) != 2:
         return None
     try:
-        index = int(message.parameter[1]) - 1
+        n = int(message.parameter[1]) - 1
     except ValueError:
         return None
-    return index if 0 <= index < len(load_rules()) else None
+    rules = visible_rules(message)
+    return rules[n][0] if 0 <= n < len(rules) else None
 
 
-@wf.sub_command(command="del")
-async def wf_del(message: Message):
+async def wf_del(client: Client, message: Message):
     index = get_index(message)
     if index is None:
         return await respond(message, "编号无效，用 <code>,wf list</code> 查看。")
     rules = list(load_rules())
     rule = rules.pop(index)
     save_rules(rules)
-    await respond(message, f"已删除：\n{format_rule(index + 1, rule)}")
+    await respond(message, f"已删除：\n{format_rule(int(message.parameter[1]), rule)}")
 
 
 async def set_enabled(message: Message, enabled: bool):
@@ -342,17 +363,41 @@ async def set_enabled(message: Message, enabled: bool):
     rules = list(load_rules())
     rules[index]["enabled"] = enabled
     save_rules(rules)
-    await respond(message, format_rule(index + 1, rules[index]))
+    await respond(message, format_rule(int(message.parameter[1]), rules[index]))
 
 
-@wf.sub_command(command="on")
-async def wf_on(message: Message):
+async def wf_on(client: Client, message: Message):
     await set_enabled(message, True)
 
 
-@wf.sub_command(command="off")
-async def wf_off(message: Message):
+async def wf_off(client: Client, message: Message):
     await set_enabled(message, False)
+
+
+SUBCOMMANDS = {
+    "chats": wf_chats,
+    "who": wf_who,
+    "add": wf_add,
+    "list": wf_list,
+    "del": wf_del,
+    "on": wf_on,
+    "off": wf_off,
+}
+
+
+# 只注册一个命令、在内部分发子命令：PagerMaid 给子命令的权限名是 plugins.<子命令>，
+# 会和其他插件的同名子命令混在一起，这样 sudo 用户只需要 plugins.wf 一个权限
+@listener(
+    command="wf",
+    description="监听指定用户发言并自动转发",
+    parameters=HELP_TEXT,
+)
+async def wf(client: Client, message: Message):
+    sub = message.parameter[0].lower() if message.parameter else ""
+    handler = SUBCOMMANDS.get(sub)
+    if handler is None:
+        return await respond(message, HELP_TEXT)
+    await handler(client, message)
 
 
 async def do_forward(target: int, message: Message, ids: List[int], mode: str):
